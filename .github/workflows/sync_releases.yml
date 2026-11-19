@@ -1,0 +1,267 @@
+name: Sync Upstream Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时检查一次，使用 UTC 时间
+    - cron: "23 */6 * * *"
+  push:
+    paths:
+      - ".github/workflows/sync_releases.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_REPO: ${{ github.repository }}
+
+      # 留空：自动识别 Fork 的直接上游
+      # 也可以手动填写，例如 trhhubsd/ARTEX
+      UPSTREAM_REPO: ""
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Sync releases and assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import urllib.parse
+
+          target = os.environ["TARGET_REPO"]
+          upstream = os.environ.get("UPSTREAM_REPO", "").strip()
+
+          def run(args, capture=True):
+              result = subprocess.run(
+                  args,
+                  check=True,
+                  text=True,
+                  stdout=subprocess.PIPE if capture else None,
+              )
+              return result.stdout if capture else None
+
+          def gh(*args):
+              return run(["gh", *args])
+
+          def api(endpoint):
+              return json.loads(gh("api", endpoint))
+
+          def paginated(endpoint):
+              pages = json.loads(
+                  gh("api", "--paginate", "--slurp", endpoint)
+              )
+              return [
+                  item
+                  for page in pages
+                  for item in page
+              ]
+
+          def tag_path(tag):
+              return urllib.parse.quote(tag, safe="")
+
+          if not upstream:
+              info = api(f"repos/{target}")
+              upstream = (
+                  (info.get("parent") or {}).get("full_name")
+              )
+              if not upstream:
+                  raise RuntimeError(
+                      "当前仓库不是 Fork，"
+                      "请在 UPSTREAM_REPO 中填写上游仓库。"
+                  )
+
+          if upstream.lower() == target.lower():
+              raise RuntimeError("上游仓库不能是当前仓库。")
+
+          print(f"上游仓库：{upstream}", flush=True)
+          print(f"目标仓库：{target}", flush=True)
+
+          # 将上游标签放入独立的本地引用空间，
+          # 避免与 Fork 已有的标签在本地发生冲突。
+          run([
+              "git", "fetch", "--no-tags",
+              f"https://github.com/{upstream}.git",
+              "+refs/tags/*:refs/upstream-tags/*",
+          ], capture=False)
+
+          releases = paginated(
+              f"repos/{upstream}/releases?per_page=100"
+          )
+          releases = [
+              release for release in releases
+              if not release.get("draft")
+          ]
+
+          existing = paginated(
+              f"repos/{target}/releases?per_page=100"
+          )
+          by_tag = {
+              release["tag_name"]: release
+              for release in existing
+          }
+
+          # 先同步旧版本，再同步新版本。
+          releases.sort(
+              key=lambda release:
+                  release.get("published_at") or ""
+          )
+
+          print(
+              f"共发现 {len(releases)} 个已发布 Release",
+              flush=True,
+          )
+
+          for release in releases:
+              tag = release["tag_name"]
+              title = release.get("name") or tag
+              body = release.get("body") or ""
+              prerelease = bool(release.get("prerelease"))
+
+              print(f"\n正在同步：{tag}", flush=True)
+
+              # 推送对应的真实上游标签。
+              # 不强制覆盖 Fork 中指向不同提交的同名标签。
+              run([
+                  "git", "push", "origin",
+                  f"refs/upstream-tags/{tag}:refs/tags/{tag}",
+              ], capture=False)
+
+              destination = by_tag.get(tag)
+
+              with tempfile.TemporaryDirectory() as temp:
+                  temp = pathlib.Path(temp)
+                  notes = temp / "release-notes.md"
+                  notes.write_text(body, encoding="utf-8")
+
+                  if destination is None:
+                      # 先建草稿，附件上传成功后再发布，
+                      # 避免展示不完整的新 Release。
+                      gh(
+                          "release", "create", tag,
+                          "--repo", target,
+                          "--verify-tag",
+                          "--title", title,
+                          "--notes-file", str(notes),
+                          "--draft",
+                      )
+                      destination = api(
+                          f"repos/{target}/releases/tags/"
+                          f"{tag_path(tag)}"
+                      )
+
+                  source_assets = paginated(
+                      f"repos/{upstream}/releases/"
+                      f"{release['id']}/assets?per_page=100"
+                  )
+                  destination_assets = paginated(
+                      f"repos/{target}/releases/"
+                      f"{destination['id']}/assets?per_page=100"
+                  )
+                  destination_by_name = {
+                      asset["name"]: asset
+                      for asset in destination_assets
+                  }
+
+                  pending = []
+                  for asset in source_assets:
+                      previous = destination_by_name.get(
+                          asset["name"]
+                      )
+                      if (
+                          previous is None
+                          or previous["size"] != asset["size"]
+                          or (
+                              asset.get("digest")
+                              and previous.get("digest")
+                              and asset["digest"]
+                                  != previous["digest"]
+                          )
+                      ):
+                          pending.append(asset)
+
+                  if pending:
+                      assets_dir = temp / "assets"
+                      assets_dir.mkdir()
+
+                      # GitHub CLI 负责从上游下载 Release 附件。
+                      gh(
+                          "release", "download", tag,
+                          "--repo", upstream,
+                          "--dir", str(assets_dir),
+                      )
+
+                      for asset in pending:
+                          name = asset["name"]
+
+                          # 防止异常附件名被当成路径。
+                          if (
+                              name in (".", "..")
+                              or "/" in name
+                              or "\\" in name
+                          ):
+                              raise RuntimeError(
+                                  f"不支持的附件名称：{name!r}"
+                              )
+
+                          local_file = assets_dir / name
+                          if not local_file.is_file():
+                              raise RuntimeError(
+                                  f"附件下载后不存在：{name}"
+                              )
+                          if (
+                              local_file.stat().st_size
+                              != asset["size"]
+                          ):
+                              raise RuntimeError(
+                                  f"附件大小校验失败：{name}"
+                              )
+
+                          print(
+                              f"上传附件：{name}", flush=True
+                          )
+                          gh(
+                              "release", "upload", tag,
+                              str(local_file),
+                              "--repo", target,
+                              "--clobber",
+                          )
+                  else:
+                      print(
+                          "附件已齐全，无需上传。",
+                          flush=True,
+                      )
+
+                  # 更新说明与预发布状态，并发布新建的草稿。
+                  gh(
+                      "release", "edit", tag,
+                      "--repo", target,
+                      "--title", title,
+                      "--notes-file", str(notes),
+                      f"--prerelease={str(prerelease).lower()}",
+                      "--draft=false",
+                  )
+
+                  print(f"同步完成：{tag}", flush=True)
+
+          print("\n所有 Release 同步完成。", flush=True)
+          PY
